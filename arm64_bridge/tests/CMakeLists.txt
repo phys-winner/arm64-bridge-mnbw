@@ -1,0 +1,130 @@
+cmake_minimum_required(VERSION 3.22)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(warband_native_input_tests LANGUAGES CXX)
+endif()
+
+include(CTest)
+
+function(add_warband_input_test target source)
+    add_executable(${target} "${CMAKE_CURRENT_LIST_DIR}/${source}")
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    if(ANDROID)
+        # Pixel 10-class Android devices use 16 KiB pages. Standalone test executables
+        # must have the same load-segment alignment as the production bridge library.
+        target_link_options(${target} PRIVATE
+            "-Wl,-z,max-page-size=16384"
+            "-Wl,-z,common-page-size=16384")
+    endif()
+    if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}>)
+    endif()
+endfunction()
+
+add_warband_input_test(input_arbitration_test input_arbitration_test.cpp)
+add_warband_input_test(menu_touch_input_test menu_touch_input_test.cpp)
+add_warband_input_test(map_touch_input_test map_touch_input_test.cpp)
+add_warband_input_test(inventory_touch_input_test inventory_touch_input_test.cpp)
+add_warband_input_test(inventory_quick_transfer_test inventory_quick_transfer_test.cpp)
+add_warband_input_test(inventory_edge_scroll_test inventory_edge_scroll_test.cpp)
+add_warband_input_test(inventory_scroll_state_test inventory_scroll_state_test.cpp)
+add_warband_input_test(touch_target_geometry_test touch_target_geometry_test.cpp)
+add_warband_input_test(scrollbar_drag_test scrollbar_drag_test.cpp)
+add_warband_input_test(gl_float_state_count_test gl_float_state_count_test.cpp)
+add_warband_input_test(shadow_render_target_test shadow_render_target_test.cpp)
+add_warband_input_test(postfx_portability_test postfx_portability_test.cpp)
+add_warband_input_test(map_water_sampler_portability_test map_water_sampler_portability_test.cpp)
+add_warband_input_test(startup_frame_guard_test startup_frame_guard_test.cpp)
+add_warband_input_test(default_framebuffer_background_test default_framebuffer_background_test.cpp)
+add_warband_input_test(shader_path_guard_test shader_path_guard_test.cpp)
+add_warband_input_test(shader_source_fixes_test shader_source_fixes_test.cpp)
+add_warband_input_test(compressed_texture_fallback_test compressed_texture_fallback_test.cpp)
+add_warband_input_test(mod_texture_codec_test mod_texture_codec_test.cpp)
+add_warband_input_test(mod_astc_encoder_test mod_astc_encoder_test.cpp)
+target_sources(mod_astc_encoder_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/mod_astc_encoder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder/astc.cpp")
+target_include_directories(mod_astc_encoder_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder")
+if(MSVC)
+    target_compile_options(mod_astc_encoder_test PRIVATE /wd4244 /wd4456 /wd4701)
+endif()
+if(NOT DEFINED WARBAND_ASTCENC_TARGET)
+    set(ASTCENC_CLI OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_DECOMPRESSOR OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_SHAREDLIB OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_UNITTEST OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_DIAGNOSTICS OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_WERROR OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_BLOCK_MAX_TEXELS 36 CACHE STRING "" FORCE)
+    set(ASTCENC_ISA_NONE ON CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_NATIVE OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_NEON OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_AVX2 OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_SSE41 OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_SSE2 OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_SVE_128 OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_SVE_256 OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/astcenc"
+                     "${CMAKE_CURRENT_BINARY_DIR}/astcenc" EXCLUDE_FROM_ALL)
+    set(WARBAND_ASTCENC_TARGET astcenc-none-static)
+endif()
+target_link_libraries(mod_astc_encoder_test PRIVATE ${WARBAND_ASTCENC_TARGET})
+add_warband_input_test(mod_texture_conversion_test mod_texture_conversion_test.cpp)
+target_sources(mod_texture_conversion_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/mod_texture_conversion.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/mod_astc_encoder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/etc1_encoder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder/astc.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder/etc.cpp")
+target_include_directories(mod_texture_conversion_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder")
+target_compile_definitions(mod_texture_conversion_test PRIVATE WARBAND_MOD_TEXTURE_TESTS)
+target_link_libraries(mod_texture_conversion_test PRIVATE ${WARBAND_ASTCENC_TARGET})
+if(MSVC)
+    target_compile_options(mod_texture_conversion_test PRIVATE /wd4244 /wd4456 /wd4701)
+    target_compile_definitions(mod_texture_conversion_test PRIVATE
+        _CRT_SECURE_NO_WARNINGS _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING)
+endif()
+target_sources(compressed_texture_fallback_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/etc1_encoder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder/astc.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder/etc.cpp")
+target_include_directories(compressed_texture_fallback_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/texture2ddecoder")
+if(MSVC)
+    target_compile_options(compressed_texture_fallback_test PRIVATE /wd4244 /wd4456 /wd4701)
+endif()
+add_warband_input_test(conversation_touch_test conversation_touch_test.cpp)
+add_warband_input_test(mission_button_state_test mission_button_state_test.cpp)
+add_warband_input_test(fmod_host_decode_contract_test fmod_host_decode_contract_test.cpp)
+add_warband_input_test(guest_settings_protocol_test guest_settings_protocol_test.cpp)
+add_warband_input_test(camera_look_input_test camera_look_input_test.cpp)
+add_warband_input_test(text_input_queue_test text_input_queue_test.cpp)
+target_compile_definitions(text_input_queue_test PRIVATE
+    WARBAND_JNI_BRIDGE_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../src/jni_bridge.cpp")
+add_warband_input_test(guest_stdio_test guest_stdio_test.cpp)
+if(ANDROID AND TARGET dynarmic)
+    add_warband_input_test(fastmem_fpsr_test fastmem_fpsr_test.cpp)
+    target_link_libraries(fastmem_fpsr_test PRIVATE dynarmic)
+    add_warband_input_test(svc_trampoline_test svc_trampoline_test.cpp)
+    add_warband_input_test(rsb_pointer_test rsb_pointer_test.cpp)
+    add_warband_input_test(fastmem_nzcv_test fastmem_nzcv_test.cpp)
+    foreach(target svc_trampoline_test rsb_pointer_test fastmem_nzcv_test)
+        target_link_libraries(${target} PRIVATE dynarmic fmt::fmt merry::mcl tsl::robin_map merry::oaknut)
+        target_include_directories(${target} PRIVATE "${dynarmic_SOURCE_DIR}/src")
+    endforeach()
+    # Original-game machine-code fixtures stay local and are absent from releases.
+    foreach(test warband_skinning warband_geometry warband_animation
+                 warband_render_commit warband_render_buffers)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test}_test.cpp")
+            add_warband_input_test(${test}_test ${test}_test.cpp)
+            target_link_libraries(${test}_test PRIVATE dynarmic)
+        endif()
+    endforeach()
+endif()

@@ -1,0 +1,360 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925f..a6a60c0c 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -13,10 +13,12 @@
+ #include "dynarmic/common/cast_util.h"
+ #include "dynarmic/common/fp/fpcr.h"
+ #include "dynarmic/frontend/A32/a32_location_descriptor.h"
++#include "dynarmic/frontend/A32/a32_types.h"
+ #include "dynarmic/frontend/A32/translate/a32_translate.h"
+ #include "dynarmic/interface/A32/config.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/ir/opt/passes.h"
++#include "dynarmic/ir/opcodes.h"
+ 
+ namespace Dynarmic::Backend::Arm64 {
+ 
+@@ -237,6 +239,9 @@ void A32AddressSpace::EmitPrelude() {
+         }
+ 
+         if (conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
++            if (conf.cache_rsb_pointer && !conf.enable_cycle_counting) {
++                code.MOV(Xticks, 0);
++            }
+             code.LDR(Xscratch0, l_return_to_dispatcher);
+             for (size_t i = 0; i < RSBCount; i++) {
+                 code.STR(Xscratch0, SP, offsetof(StackLayout, rsb) + offsetof(RSBEntry, code_ptr) + i * sizeof(RSBEntry));
+@@ -276,6 +281,9 @@ void A32AddressSpace::EmitPrelude() {
+         }
+ 
+         if (conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
++            if (conf.cache_rsb_pointer && !conf.enable_cycle_counting) {
++                code.MOV(Xticks, 0);
++            }
+             code.LDR(Xscratch0, l_return_to_dispatcher);
+             for (size_t i = 0; i < RSBCount; i++) {
+                 code.STR(Xscratch0, SP, offsetof(StackLayout, rsb) + offsetof(RSBEntry, code_ptr) + i * sizeof(RSBEntry));
+@@ -395,6 +403,7 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+ 
+         .wall_clock_cntpct = conf.wall_clock_cntpct,
+         .enable_cycle_counting = conf.enable_cycle_counting,
++        .cache_rsb_pointer = conf.cache_rsb_pointer,
+ 
+         .always_little_endian = conf.always_little_endian,
+ 
+@@ -410,14 +419,50 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+ 
+         .coprocessors = conf.coprocessors,
+ 
++        .a32_is_svc_trampoline = [this](const IR::Block& block) {
++            const A32::LocationDescriptor location{block.Location()};
++            if (!conf.fuse_svc_trampolines || conf.enable_cycle_counting ||
++                location.TFlag() || location.SingleStepping() ||
++                location.PC() > 0xfffffff8u ||
++                block.GetCondition() != IR::Cond::AL || block.size() != 3 ||
++                block.EndLocation() != location.AdvancePC(4)) {
++                return false;
++            }
++            const auto terminal = block.GetTerminal();
++            const auto* halt = boost::get<IR::Term::CheckHalt>(&terminal);
++            if (!halt || !boost::get<IR::Term::PopRSBHint>(&halt->else_)) {
++                return false;
++            }
++            const auto svc = conf.callbacks->MemoryReadCode(location.PC());
++            const auto ret = conf.callbacks->MemoryReadCode(location.PC() + 4);
++            if (!svc || !ret || (*svc & 0xff000000) != 0xef000000 ||
++                (*svc & 0x00ffffff) == 0 || *ret != 0xe12fff1e) {
++                return false;
++            }
++            auto it = block.begin();
++            if (it->GetOpcode() != IR::Opcode::PushRSB ||
++                it->GetArg(0).GetU64() != location.AdvancePC(4).UniqueHash()) {
++                return false;
++            }
++            ++it;
++            if (it->GetOpcode() != IR::Opcode::A32SetRegister ||
++                it->GetArg(0).GetA32RegRef() != A32::Reg::PC ||
++                !it->GetArg(1).IsImmediate() || it->GetArg(1).GetU32() != location.PC() + 4) {
++                return false;
++            }
++            ++it;
++            return it->GetOpcode() == IR::Opcode::A32CallSupervisor &&
++                   it->GetArg(0).IsImmediate() && it->GetArg(0).GetU32() == (*svc & 0x00ffffff);
++        },
++
+         .very_verbose_debugging_output = conf.very_verbose_debugging_output,
+     };
+ }
+ 
+-void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
++void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& info) {
+     const A32::LocationDescriptor descriptor{block.Location()};
+     const A32::LocationDescriptor end_location{block.EndLocation()};
+-    const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1);
++    const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1 + (info.a32_svc_trampoline ? 4 : 0));
+     block_ranges.AddRange(range, descriptor);
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
+index 1ecb5424..13d64d3e 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64.cpp
+@@ -46,6 +46,9 @@ void EmitIR<IR::Opcode::CallHostFunction>(oaknut::CodeGenerator& code, EmitConte
+ 
+ template<>
+ void EmitIR<IR::Opcode::PushRSB>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if (ctx.ebi.a32_svc_trampoline) {
++        return;
++    }
+     if (!ctx.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+         return;
+     }
+@@ -54,11 +57,18 @@ void EmitIR<IR::Opcode::PushRSB>(oaknut::CodeGenerator& code, EmitContext& ctx,
+     ASSERT(args[0].IsImmediate());
+     const IR::LocationDescriptor target{args[0].GetImmediateU64()};
+ 
+-    code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+-    code.ADD(Wscratch2, Wscratch2, sizeof(RSBEntry));
+-    code.AND(Wscratch2, Wscratch2, RSBIndexMask);
+-    code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+-    code.ADD(Xscratch2, SP, Xscratch2);
++    if (ctx.conf.cache_rsb_pointer && !ctx.conf.enable_cycle_counting) {
++        // X26 is reserved for ticks and is callee-saved across native callbacks.
++        code.ADD(Xticks.toW(), Xticks.toW(), sizeof(RSBEntry));
++        code.AND(Xticks.toW(), Xticks.toW(), RSBIndexMask);
++        code.ADD(Xscratch2, SP, Xticks);
++    } else {
++        code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++        code.ADD(Wscratch2, Wscratch2, sizeof(RSBEntry));
++        code.AND(Wscratch2, Wscratch2, RSBIndexMask);
++        code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++        code.ADD(Xscratch2, SP, Xscratch2);
++    }
+ 
+     code.MOV(Xscratch0, target.Value());
+     EmitBlockLinkRelocation(code, ctx, target, BlockRelocationType::MoveToScratch1);
+@@ -197,6 +207,7 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+     }
+ 
+     EmittedBlockInfo ebi;
++    ebi.a32_svc_trampoline = conf.a32_is_svc_trampoline && conf.a32_is_svc_trampoline(block);
+ 
+     FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
+     RegAlloc reg_alloc{code, fpsr_manager, GPR_ORDER, FPR_ORDER};
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index 58ccb0e4..01010659 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -7,6 +7,7 @@
+ 
+ #include <array>
+ #include <cstddef>
++#include <functional>
+ #include <memory>
+ #include <vector>
+ 
+@@ -104,6 +105,7 @@ struct EmittedBlockInfo {
+     std::vector<Relocation> relocations;
+     tsl::robin_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
+     tsl::robin_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
++    bool a32_svc_trampoline = false;
+ };
+ 
+ struct EmitConfig {
+@@ -140,6 +142,7 @@ struct EmitConfig {
+     // Timing
+     bool wall_clock_cntpct;
+     bool enable_cycle_counting;
++    bool cache_rsb_pointer = false;
+ 
+     // Endianness
+     bool always_little_endian;
+@@ -158,6 +161,7 @@ struct EmitConfig {
+ 
+     // A32 specific
+     std::array<std::shared_ptr<A32::Coprocessor>, 16> coprocessors{};
++    std::function<bool(const IR::Block&)> a32_is_svc_trampoline{};
+ 
+     // Debugging
+     bool very_verbose_debugging_output;
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 909dde73..0ec2884d 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -97,11 +97,17 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
+     if (ctx.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+         oaknut::Label fail;
+ 
+-        code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+-        code.AND(Wscratch2, Wscratch2, RSBIndexMask);
+-        code.ADD(X2, SP, Xscratch2);
+-        code.SUB(Wscratch2, Wscratch2, sizeof(RSBEntry));
+-        code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++        if (ctx.conf.cache_rsb_pointer && !ctx.conf.enable_cycle_counting) {
++            code.ADD(X2, SP, Xticks);
++            code.SUB(Xticks.toW(), Xticks.toW(), sizeof(RSBEntry));
++            code.AND(Xticks.toW(), Xticks.toW(), RSBIndexMask);
++        } else {
++            code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++            code.AND(Wscratch2, Wscratch2, RSBIndexMask);
++            code.ADD(X2, SP, Xscratch2);
++            code.SUB(Wscratch2, Wscratch2, sizeof(RSBEntry));
++            code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++        }
+ 
+         code.LDP(Xscratch0, Xscratch1, X2, offsetof(StackLayout, rsb));
+ 
+@@ -170,8 +176,9 @@ void EmitA32CheckMemoryAbort(oaknut::CodeGenerator& code, EmitContext& ctx, IR::
+ 
+     const A32::LocationDescriptor current_location{IR::LocationDescriptor{inst->GetArg(0).GetU64()}};
+ 
+-    code.LDAR(Xscratch0, Xhalt);
+-    code.TST(Xscratch0, static_cast<u32>(HaltReason::MemoryAbort));
++    // HaltReason is 32-bit and its pointer need only be four-byte aligned.
++    code.LDAR(Wscratch0, Xhalt);
++    code.TST(Wscratch0, static_cast<u32>(HaltReason::MemoryAbort));
+     code.B(EQ, end);
+     EmitSetUpperLocationDescriptor(code, ctx, current_location, ctx.block.Location());
+     code.MOV(Wscratch0, current_location.PC());
+@@ -606,6 +613,34 @@ void EmitIR<IR::Opcode::A32CallSupervisor>(oaknut::CodeGenerator& code, EmitCont
+         code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
+         code.MOV(Xticks, X0);
+     }
++
++    if (ctx.ebi.a32_svc_trampoline) {
++        // The callback must see the original SVC-next PC. Only the unchanged
++        // descriptor can continue with the known ARM BX LR; changed state or a
++        // halt resumes through the dispatcher without consuming the caller RSB.
++        oaknut::Label dispatch, end;
++        code.LDAR(Wscratch0, Xhalt);
++        code.CBNZ(Wscratch0, dispatch);
++        code.LDUR(Xscratch0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++        code.MOV(Xscratch1, ctx.block.EndLocation().Value());
++        code.CMP(Xscratch0, Xscratch1);
++        code.B(NE, dispatch);
++
++        code.LDR(Wscratch0, Xstate, offsetof(A32JitState, regs) + 14 * sizeof(u32));
++        code.ANDS(Wscratch1, Wscratch0, 1);
++        code.MOV(Wscratch2, 3);
++        code.CSEL(Wscratch2, Wscratch1, Wscratch2, NE);
++        code.BIC(Wscratch2, Wscratch0, Wscratch2);
++        const u32 upper_without_t = static_cast<u32>(ctx.block.EndLocation().Value() >> 32) & ~u32{1};
++        code.MOV(Wscratch0, upper_without_t);
++        code.CINC(Wscratch0, Wscratch0, NE);
++        code.STP(Wscratch2, Wscratch0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++        code.B(end);
++
++        code.l(dispatch);
++        EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++        code.l(end);
++    }
+ }
+ 
+ template<>
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a64.cpp b/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+index 5152a54b..537bc140 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+@@ -153,8 +153,9 @@ void EmitA64CheckMemoryAbort(oaknut::CodeGenerator& code, EmitContext& ctx, IR::
+ 
+     const A64::LocationDescriptor current_location{IR::LocationDescriptor{inst->GetArg(0).GetU64()}};
+ 
+-    code.LDAR(Xscratch0, Xhalt);
+-    code.TST(Xscratch0, static_cast<u32>(HaltReason::MemoryAbort));
++    // HaltReason is 32-bit and its pointer need only be four-byte aligned.
++    code.LDAR(Wscratch0, Xhalt);
++    code.TST(Wscratch0, static_cast<u32>(HaltReason::MemoryAbort));
+     code.B(EQ, end);
+     code.MOV(Xscratch0, current_location.PC());
+     code.STR(Xscratch0, Xstate, offsetof(A64JitState, pc));
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+index 339e2c59..8a3d3e5d 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -533,7 +533,6 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
+         }
+     }();
+     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
+-    ctx.fpsr.Spill();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -542,7 +541,9 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
+     const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+     const auto fastmem_location = EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered, ShouldExt32(ctx));
+ 
+-    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end, fastmem_location] {
++    // Direct loads preserve FPSR. Fork its compile-time state for the callback
++    // branch so only that branch spills accumulated guest exceptions.
++    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end, fastmem_location, fpsr = ctx.fpsr]() mutable {
+         ctx.ebi.fastmem_patch_info.emplace(
+             fastmem_location - ctx.ebi.entry_point,
+             FastmemPatchInfo{
+@@ -554,8 +555,11 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
+             });
+ 
+         code.l(*fallback);
++        fpsr.Spill();
+         code.MOV(Xscratch0, Xaddr);
+         EmitRelocation(code, ctx, WrappedReadMemoryLinkTarget(bitsize));
++        // Callback FP exceptions must not become guest FP exceptions.
++        fpsr.Load();
+         if (ordered) {
+             code.DMB(oaknut::BarrierOp::ISH);
+         }
+@@ -583,7 +587,6 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+         }
+     }();
+     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
+-    ctx.fpsr.Spill();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -592,7 +595,8 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+     const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+     const auto fastmem_location = EmitMemoryStr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered, ShouldExt32(ctx));
+ 
+-    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end, fastmem_location] {
++    // Stores need the same isolated callback state as loads.
++    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end, fastmem_location, fpsr = ctx.fpsr]() mutable {
+         ctx.ebi.fastmem_patch_info.emplace(
+             fastmem_location - ctx.ebi.entry_point,
+             FastmemPatchInfo{
+@@ -604,6 +608,7 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+             });
+ 
+         code.l(*fallback);
++        fpsr.Spill();
+         if constexpr (bitsize == 128) {
+             code.MOV(Xscratch0, Xaddr);
+             code.MOV(Q0.B16(), Rvalue.B16());
+@@ -615,6 +620,7 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+             code.DMB(oaknut::BarrierOp::ISH);
+         }
+         EmitRelocation(code, ctx, WrappedWriteMemoryLinkTarget(bitsize));
++        fpsr.Load();
+         if (ordered) {
+             code.DMB(oaknut::BarrierOp::ISH);
+         }
+diff --git a/src/dynarmic/interface/A32/config.h b/src/dynarmic/interface/A32/config.h
+index 360df06e..147fe05f 100644
+--- a/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/interface/A32/config.h
+@@ -228,6 +228,16 @@ struct UserConfig {
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+ 
++    /// ARM64 backend: retain the return stack buffer's ring offset in the unused
++    /// tick register. Ignored when cycle counting or the RSB optimization is off.
++    bool cache_rsb_pointer = false;
++
++    /// ARM64 bridge-only optimization for immutable ARM SVC #nonzero; BX LR
++    /// trampolines. Code changes must invalidate both instructions. Disabled
++    /// during single stepping or cycle counting; callbacks may still change PC,
++    /// CPSR or FPSCR, request a halt, or make nested guest calls.
++    bool fuse_svc_trampolines = false;
++
+     /// This option relates to the CPSR.E flag. Enabling this option disables modification
+     /// of CPSR.E by the emulated program, forcing it to 0.
+     /// NOTE: Calling Jit::SetCpsr with CPSR.E=1 while this option is enabled may result

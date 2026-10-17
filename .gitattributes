@@ -1,0 +1,16 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.S text eol=lf
+*.ld text eol=lf
+*.cmake text eol=lf
+*.patch text eol=lf
+*.java text eol=lf
+*.md text eol=lf
+*.ps1 text eol=lf
+*.bat text eol=crlf
+CMakeLists.txt text eol=lf
